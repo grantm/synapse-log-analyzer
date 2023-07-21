@@ -576,7 +576,12 @@ Here's an example config file:
 }
 
 
-=head1
+=head1 LINKS
+
+The git repository for this script is at:
+https://github.com/grantm/synapse-log-analyzer
+
+=head1 COPYRIGHT
 
 This script was written by Grant McLean <grantm@cpan.org>.  You can
 redistribute it and/or modify it under the terms of the Apache License
