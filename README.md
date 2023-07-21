@@ -54,7 +54,7 @@ pipe the output into a tool like `jq`.
 ## Configure default log paths
 
 Instead of typing the full pathname of the log file (or files) every time, you
-can create a config file at `~/synapse-log-analyzer.json` and define which
+can create a config file at `~/.synapse-log-analyzer.json` and define which
 directory and which files you want to search by default:
 
 ```
