@@ -23,14 +23,56 @@ use open qw( :encoding(UTF-8) :std );
 use File::Spec::Functions qw(splitpath catfile);
 use Pod::Usage            qw(pod2usage);
 use Getopt::Long          qw(GetOptionsFromArray);
+use POSIX                 qw();
 use JSON::MaybeXS         qw(decode_json JSON);
 use Data::Dumper          qw(Dumper);
 
+
+
+my $buffer_expiry = 600;    # discard buffered lines after 10min
+
+my $initial_fields = qr{
+    \A
+    (?<ts_date>[0-9]{4}-[0-9]{2}-[0-9]{2})[ ]
+    (?<ts_time>[0-9]{2}:[0-9]{2}:[0-9]{2}),
+    (?<ts_ms>\d+)[ ]-[ ]
+    (?<logger>\S+)[ ]-[ ]
+    (?<code_line>\d+)[ ]-[ ]
+    (?<log_level>\w+)[ ]-[ ]
+    (?<request_id>\S+)[ ]-[ ]
+}x;
+
+my $request_line = qr{
+    $initial_fields
+    (?<client_ip>\S+)[ ]-[ ]
+    (?<server_port>\S+)[ ]-[ ]
+    \{(?<user>\S*)\}[ ]
+    Processed[ ]request:[ ]
+    (?<time_elapsed>[0-9.]+)sec/
+    -?(?<time_send>[0-9.]+)sec[ ][(]
+    (?<time_user>[0-9.]+)sec,[ ]
+    (?<time_sys>[0-9.]+)sec[)][ ][(]
+    (?<time_db_pool>[0-9.]+)sec/
+    (?<time_db_queries>[0-9.]+)sec/
+    (?<count_db_txn>[0-9]+)[)][ ]
+    (?<resp_bytes>\d+)B[ ]
+    (?<resp_code>\d+)(?<resp_abandoned>!?)[ ]
+    "(?<req_method>\w+)[ ](?<req_path>[^?\s]+)(?<req_query>(?:[?]\S+)?)[ ][^"]+"[ ]
+    "(?<user_agent>[^"]+)"[ ]
+    \[(?<count_db_evts>[0-9]+)[ ]dbevts\]
+}xn;
+
+my $non_request_line = qr{
+    $initial_fields
+    (?<log_message>\S.*)$
+}xn;
 
 my @known_fields = qw(
     log_path
     log_file
     timestamp
+    ts_date
+    ts_time
     logger
     code_line
     log_level
@@ -55,6 +97,7 @@ my @known_fields = qw(
     req_query
     user_agent
     count_db_evts
+    extra_lines
 );
 my %field_is_known = map { $_ => 1 } @known_fields;
 
@@ -76,6 +119,7 @@ if(!GetOptionsFromArray(
     'fields=s',
     'filter|f=s',
     'list_fields|list-fields',
+    'regex=s',
     'tally',
     'help|?',
 )) {
@@ -96,12 +140,14 @@ else {
             -message => "Please use either --output or --json, not both"
         );
     }
+    my $regex     = $opt{regex} ? qr{$opt{regex}} : '';
     my $filter    = make_filter($opt{filter});
     my $formatter = $opt{json}
         ? json_formatter($opt{fields})
         : make_formatter($opt{output}, $opt{fields});
     my @log_files = log_paths(@expanded_args);
     analyse_logs(
+        regex         => $regex,
         filter        => $filter,
         formatter     => $formatter,
         tally_output  => $opt{tally},
@@ -365,11 +411,13 @@ sub log_dir {
 
 sub analyse_logs {
     my %args = @_;
+    my $regex         = $args{regex};
     my $filter        = $args{filter};
     my $formatter     = $args{formatter};
     my $tally_output  = $args{tally_output};
     my $logs_files    = $args{log_files};
 
+    my $buffer = MessageBuffer->new();
     my %tally;
 
     for my $path (@$logs_files) {
@@ -382,7 +430,9 @@ sub analyse_logs {
             open $fh, '<', $path;
         }
         LINE: while(my $line = <$fh>) {
-            # print $line;
+            if($regex and $line !~ $regex) {
+                next;
+            }
             my %rec;
             chomp($line);
             if(my($prefix, $rest) = $line =~ m{\A(\S+):([0-9]{4}-[0-9]{2}-[0-9]{2} .*)\z}) {
@@ -390,63 +440,51 @@ sub analyse_logs {
                 ($log_file) = $path =~ m{([^/]+)$};
                 $line = $rest;
             }
-            next unless $line =~ m{
-                \A
-                (?<ts_date>[0-9]{4}-[0-9]{2}-[0-9]{2})[ ]
-                (?<ts_time>[0-9]{2}:[0-9]{2}:[0-9]{2}),
-                (?<ts_ms>\d+)[ ]-[ ]
-                (?<logger>\S+)[ ]-[ ]
-                (?<code_line>\d+)[ ]-[ ]
-                (?<log_level>\w+)[ ]-[ ]
-                (?<request_id>\S+)[ ]-[ ]
-                (?<client_ip>\S+)[ ]-[ ]
-                (?<server_port>\S+)[ ]-[ ]
-                \{(?<user>\S*)\}[ ]
-                Processed[ ]request:[ ]
-                (?<time_elapsed>[0-9.]+)sec/
-                -?(?<time_send>[0-9.]+)sec[ ][(]
-                (?<time_user>[0-9.]+)sec,[ ]
-                (?<time_sys>[0-9.]+)sec[)][ ][(]
-                (?<time_db_pool>[0-9.]+)sec/
-                (?<time_db_queries>[0-9.]+)sec/
-                (?<count_db_txn>[0-9]+)[)][ ]
-                (?<resp_bytes>\d+)B[ ]
-                (?<resp_code>\d+)(?<resp_abandoned>!?)[ ]
-                "(?<req_method>\w+)[ ](?<req_path>[^?\s]+)(?<req_query>(?:[?]\S+)?)[ ][^"]+"[ ]
-                "(?<user_agent>[^"]+)"[ ]
-                \[(?<count_db_evts>[0-9]+)[ ]dbevts\]
-            }xn;
-            %rec = %+;
-            $rec{log_path} = $path;
-            $rec{log_file} = $log_file;
-            $rec{timestamp} = delete($rec{ts_date}) . 'T'
-                . delete($rec{ts_time}) . "."
-                . delete($rec{ts_ms});
-            $rec{req_query} //= '';
-            if(
-                ($rec{user} // '') =~ m{
-                    \A
-                    @(?<user_local>[^:]+)
-                    :(?<user_domain>.*)
-                    \z
-                }xn
-            ) {
-                $rec{user_local} = $+{user_local};
-                $rec{user_domain} = $+{user_domain};
+            if($line =~ $request_line) {
+                %rec = %+;
+                $rec{log_path} = $path;
+                $rec{log_file} = $log_file;
+                $rec{ts_time} = $rec{ts_time} . '.' . delete($rec{ts_ms});
+                $rec{timestamp} = $rec{ts_date} . 'T' . $rec{ts_time};
+                $rec{req_query} //= '';
+                if(
+                    ($rec{user} // '') =~ m{
+                        \A
+                        @(?<user_local>[^:]+)
+                        :(?<user_domain>.*)
+                        \z
+                    }xn
+                ) {
+                    $rec{user_local} = $+{user_local};
+                    $rec{user_domain} = $+{user_domain};
+                }
+                else {
+                    $rec{user_local} = '';
+                    $rec{user_domain} = '';
+                }
+                if($filter and not $filter->(\%rec)) {
+                    next LINE;
+                }
+                $rec{extra_lines} = $buffer->retrieve($rec{request_id}) // '';
+                my $sep = $rec{extra_lines} ? "\n" : '';
+                my $output = $formatter
+                    ? $formatter->(\%rec)
+                    : "$rec{extra_lines}$sep$line";
+                if($tally_output) {
+                    $tally{$output}++;
+                }
+                else {
+                    say $output;
+                }
             }
-            else {
-                $rec{user_local} = '';
-                $rec{user_domain} = '';
-            }
-            if($filter and not $filter->(\%rec)) {
-                next LINE;
-            }
-            my $output = $formatter ?$formatter->(\%rec) : $line;
-            if($tally_output) {
-                $tally{$output}++;
-            }
-            else {
-                say $output;
+            elsif($line =~ $non_request_line) {
+                %rec = %+;
+                $rec{log_path} = $path;
+                $rec{log_file} = $log_file;
+                $rec{ts_time} = $rec{ts_time} . '.' . delete($rec{ts_ms});
+                $rec{timestamp} = $rec{ts_date} . 'T' . $rec{ts_time};
+                $rec{full_line} = $line;
+                $buffer->store(\%rec);
             }
         }
     }
@@ -465,12 +503,104 @@ sub analyse_logs {
 }
 
 
+package MessageBuffer;
+
+# If processing a request generates multiple log lines (typically INFO/WARN
+# messages before the final response is logged and returned), they will be
+# tied together by having the same request_id value.  This object is responsible
+# for keeping track of the "non-request" lines until the final request line
+# is seen.  It also discards "expired" lines - ones for which we never saw a
+# matching request line in the 10 minutes after they were received.
+
+sub new {
+    my $class = shift;
+
+    my $self = bless {
+        @_,
+        by_id => {},
+        lru   => []
+    }, $class;
+
+    return $self;
+}
+
+
+sub store {
+    my($self, $rec) = @_;
+
+    my $request_id = $rec->{request_id};
+    my $now = $self->time_value($rec->{timestamp}) or return;
+    my $expiry = $now + $buffer_expiry;
+    my $log_line = "    $rec->{full_line}";
+
+    my($buf);
+    if($buf = $self->{by_id}->{$request_id}) {
+        my $lru = $self->{lru};
+        @$lru = grep { $_ ne $request_id } @$lru;
+    }
+    else {
+        $buf = $self->{by_id}->{$request_id} = {
+            request_id  => $request_id,
+            log_lines   => [],
+        };
+    }
+
+    push @{ $buf->{log_lines} }, $log_line;
+    $buf->{expiry} = $expiry;
+
+    $self->_expire_cache($now);
+    push @{ $self->{lru} }, $request_id;
+}
+
+
+sub retrieve {
+    my($self, $request_id) = @_;
+
+    my $buf = delete($self->{by_id}->{$request_id}) or return;
+    my $lru = $self->{lru};
+    @$lru = grep { $_ ne $request_id } @$lru;
+    return join("\n", @{ $buf->{log_lines} });
+}
+
+
+sub time_value {
+    my($self, $timestamp) = @_;
+
+    if($timestamp =~ m{\A(\d\d\d\d)-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)}) {
+        return POSIX::mktime($6, $5, $4, $3, $2 - 1, $1 - 1900);
+    }
+    return;
+}
+
+
+sub _expire_cache {
+    my($self, $now) = @_;
+
+    my $by_id = $self->{by_id};
+    my $lru   = $self->{lru};
+    while(@$lru) {
+        my $request_id = $lru->[0];
+        if(my $buf = $by_id->{$request_id}) {
+            if($buf->{expiry} <= $now) {
+                delete $by_id->{$request_id};
+                shift @$lru;
+                next;
+            }
+        }
+        else {
+            shift(@$lru);
+            next;
+        }
+        return;
+    }
+}
+
 
 __END__
 
 =head1 NAME
 
-synapse-log-analyzer - short description here
+synapse-log-analyzer - examine Synapse logs using filters and output formats
 
 =head1 SYNOPSIS
 
@@ -484,13 +614,14 @@ synapse-log-analyzer - short description here
     --filter <string>   an expression for selecting lines to output
     --bundle <name>     include a named "bundle" of options from config file
     --list-fields       list all known fields
+    --regex <pattern>   a Perl regex used to "pre-filter" lines
     --tally             report number of occurrences of each output line
     --help              detailed help message
 
 =head1 DESCRIPTION
 
 A tool for examining Synapse log files with options to filter which lines
-and to format the output.
+to include and to format the output.
 
 =head1 OPTIONS
 
@@ -503,7 +634,13 @@ Include a named collection of option settings from the config file.
 =item B<< --fields <string> >>
 
 Specify which fields you want included in the output, as either a comma or space
-delimited string.
+delimited string.  Example:
+
+  --fields 'timestamp,user,resp_code,req_method,req_path'
+
+The special field C<extra_lines> will potentially contain newline characters.
+This field contains any messages that were logged with the same C<request_id>
+while the request was being processed and before the response was sent.
 
 =item B<< --filter <filter-string> >> (alias: B<-f>)
 
@@ -540,6 +677,12 @@ contain literal text and named field values in the form: C<${field_name}>.
 For example:
 
   --output 'user="${user}" status_code="${resp_status}"'
+
+=item B<< --regex <pattern> >>
+
+A user-supplied Perl regular expression which is used to pre-filter the log
+lines.  This can be used to speed processing by skipping the step of parsing
+every field for lines which aren't considered interesting.
 
 =item B<< --tally >>
 
