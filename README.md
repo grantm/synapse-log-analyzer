@@ -91,9 +91,10 @@ whole line on STDOUT, but there are a number of alternatives:
   --output 'User=${user_local} Path=${req_path} Code=${resp_code}'
   ```
 
-- Request JSON output. Either all available fields, or user specified with `--fields`
+- Request JSON output. Either all available fields, or user-specified with via
+  the `--fields` option
   ```
-  --fields 'user_local,resp_code,req_method,req_path'
+  --json --fields 'user_local,resp_code,req_method,req_path'
   ```
 
 ## Reusing filters
@@ -122,6 +123,20 @@ bundles:
 synapse-log-analyzer -b permission_denied -b json_brief
 ```
 
+## Tallying output
+
+The `--tally` option allows you to report a count of unique output lines rather
+then reporting every line.  For example:
+
+```
+synapse-log-analyzer --filter 'req_method = POST' --filter 'req_path = /_matrix/media/r0/upload' --fields 'user' --tally
+  1  @andrea:example.com
+  9  @philip:example.com
+ 16  @megynn:example.com
+```
+
+The tallied lines are sorted from least to most numerous.
+
 ## More info
 
 Use the `--help` option for more information about available options.
@@ -130,10 +145,11 @@ Use the `--help` option for more information about available options.
 
 Most servers probably have Perl installed already.  The only non-core dependency
 is `JSON::MaybeXS` and its associated parser module (e.g.: `Cpanel::JSON::XS`).
-On a Debian/Ubuntu server you can install these dependencies with:
+On a Debian/Ubuntu server you can install these dependencies (along with the
+`perl-doc` package - needed for the `--help` option) with:
 
 ```
-sudo apt install libjson-maybexs-perl
+sudo apt install libjson-maybexs-perl perl-doc
 ```
 
 Alternatively the modules can be installed via the `cpan` shell, however you'll
@@ -147,8 +163,12 @@ your situation, a workaround is to use `grep` directly on the log files and
 then pipe the output through `synapse-log-analyzer` to filter out false
 positives and to make use of output formatting.
 
-Another approach would be to reimplement the tool in Rust. If you do that,
-please let me know.
+Alternatively, you can do essentially the same thing using the `--regex` option
+to "pre-filter" lines and only do the more expensive field-by-field parsing and
+filteringof the lines that match the supplied Perl regular expression.
+
+Another approach would be to reimplement the tool in a lower-level language like
+Rust. If you do that, please let me know.
 
 
-[log_format]: https://matrix-org.github.io/synapse/latest/usage/administration/request_log.html`
+[log_format]: https://matrix-org.github.io/synapse/latest/usage/administration/request_log.html
